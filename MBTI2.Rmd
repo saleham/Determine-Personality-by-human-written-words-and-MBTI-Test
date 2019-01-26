@@ -1,0 +1,419 @@
+---
+title: "MBTI2"
+author: "saleh fayyaz"
+date: "July 20, 2018"
+output: html_document
+---
+---
+title: "MBTI - 2"
+output: html_notebook
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r,echo=FALSE}
+library(tidyverse)
+library(tidytext)
+library(stringr)
+library(DT)
+library('wordcloud')
+library(igraph)
+library(ggraph)
+library(tm)
+library(topicmodels)
+library(ggplot2)
+library(caret)
+library(syuzhet)
+library(text2vec)
+library(dplyr)
+library(data.table)
+library("readr")
+library(reshape2)
+library(RColorBrewer) #Data Visualisation
+library(RSentiment) #Sentiment Analysis
+library(cowplot) #Plot Arrange
+library(ggthemes) #Data Visualisation
+library(knitr)
+library(kableExtra)
+
+setwd('/media/saleh/New Volume/study/uni/8/data science/project/code')
+rm(list=ls())
+```
+in this phaze I first remove punctuation , website , ... other unimportant word in posts .
+```{r,warning=FALSE}
+data = read_csv("mbti_1.csv")
+clean=function(x){
+  x=str_replace_all(x,'[^[:alnum:]]',' ')
+  x=gsub("[\t]{2,}"," ",x)
+  x=gsub("[[:digit:]]"," ",x)
+  x=gsub("http.*"," ",x)
+  return(x)
+}
+head(data)
+types <- data.frame(type =data$type )
+sentences = str_split_fixed(data$posts,"\\|\\|\\|",50)
+type_sen = cbind(types,sentences)
+### get list that each element is for one type
+type_name <- types %>% distinct() %>% unlist()
+clean_type_sen <- type_sen
+clean_type_sen[,2:51]<- lapply(type_sen[,2:51],clean)
+head(clean_type_sen)
+```
+**finding important words based on TF_IDF creterion:**
+TF-IDF:
+We wish to know the most important words used in the posts .For this we use Term Frequency -Inverse Document Frequency matrix .TF-IDF computes a weight which represents the importance of a term inside a document.It does this by comparing the frequency of usage inside an individual document as opposed to the entire data set (a collection of documents).
+
+The importance increases proportionally to the number of times a word appears in the individual document itself–this is called Term Frequency. However, if multiple documents contain the same word many times then you run into a problem. That’s why TF-IDF also offsets this value by the frequency of the term in the entire document set, a value called Inverse Document Frequency.
+
+```{r}
+all_type_sen <- melt(clean_type_sen,id= 'type')
+all_type_sen$variable = NULL
+colnames(all_type_sen)[2] = 'text'
+head(all_type_sen,100)
+temp=subset(all_type_sen,!(is.na(all_type_sen$text)))
+temp=temp %>% unnest_tokens(word,text)%>% count(type,word,sort=TRUE) %>% ungroup()
+total_words=temp %>% group_by(type) %>% summarise(count=n())
+temp=left_join(temp,total_words)
+head(temp,10)
+```
+Here n is the number of times the word is used in the whole posts and count is the total number of terms in the posts of the respective type . We look at the] n/total for each type .
+*This is exactly what term frequency is. and means how much importance that word in document could be .* by using bind_tf_idf function from tidytext package we calculate TF :
+
+```{r}
+temp=temp %>% filter(!(is.na(type))) %>% bind_tf_idf(word,type,n)
+temp1=temp %>% filter(idf<2)%>% select(-count) %>% arrange(desc(tf_idf))
+temp1
+temp1 %>% group_by(type) %>% top_n(20) %>% ungroup() -> temp1
+for (each in unique(temp1$type)){
+  temp1 %>% filter(type==each) %>% 
+  ggplot(aes(word,tf_idf))+geom_col(show.legend=FALSE)+labs(x="",y="tf-idf",title="Top 20 Words")+facet_wrap(~type,ncol=1)+coord_flip() -> p
+  print(p)
+}
+```
+
+*World cloud of important Words for each type*
+```{r}
+for (each in unique(temp1$type)){
+  par(mfrow=c(1.2,1.2))
+  temp1 %>% filter(type==each) %>% with(wordcloud(word,tf_idf, max.words =100,min.freq=3,scale=c(4,.5),
+           random.order = FALSE,rot.per=.5,colors=palette()))+ text(x=0.5,y=0.9,each)
+}
+```
+only one words doesnt show a lot of intresting words . so I use bigrams here :
+*Using TF-IDF to know Most Important Bigrams:*
+```{r}
+temp=subset(all_type_sen,!(is.na(all_type_sen$text)))
+temp=temp %>% select(type,text) %>% unnest_tokens(bigram,text,token="ngrams",n=2)
+head(temp,10)
+tempseperated=temp %>% separate(bigram,c("word1","word2"),sep=" ")
+tempfiltered=tempseperated %>% filter(!(word1 %in% stop_words$word)) %>% filter(!(word2 %in% stop_words$word))
+temp=tempfiltered %>% unite(bigramwords,word1,word2,sep=" ") %>% group_by(bigramwords,type) %>% tally()%>% ungroup() %>% arrange(desc(n))  %>% mutate(bigramwords=factor(bigramwords,levels=rev(unique(bigramwords))))
+temp =temp %>% bind_tf_idf(bigramwords,type,n)
+temp1=temp %>% select(-n) %>% arrange(desc(tf_idf)) %>% mutate(bigramwords=factor(bigramwords,levels=rev(unique(bigramwords))))
+for (each in unique(temp1$type)){
+  temp %>% filter(type==each) %>% top_n(10) %>%  ungroup() %>%
+  ggplot(aes(bigramwords,tf_idf))+geom_col(show.legend=FALSE)+labs(x="",y="tf-idf",title="Top 20 Words")+facet_wrap(~type,ncol=1)+coord_flip() -> p
+  print(p)
+}
+
+```
+
+**sentiment analysis **
+I find positive and negetive sentimntal words count of each type(by bing sentiment) and by calculating diffrention of positive to negetive divided by whole words can find how sentiment they are .
+(posetive-negetive)/ (posetive+negtive)
+```{r}
+tokens=subset(all_type_sen,!(is.na(all_type_sen$text)))
+tokens %>% unnest_tokens(word,text) -> tokens
+tokens  %>% group_by(type)%>%
+  inner_join(get_sentiments("bing")) %>% # pull out only sentiment words
+  count(sentiment) %>% # count the # of positive & negative words
+  spread(sentiment, n, fill = 0) %>% # made data wide rather than narrow
+  mutate(sentiment = (positive - negative)/(positive + negative)) -> type_sent# # of positive words - # of negative owrds 
+type_sent %>% arrange(sentiment) %>% ggplot() + geom_bar(aes(x=reorder(type,-sentiment),y=sentiment,fill=type),stat='identity')+ theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+
+```
+
+it shows that Extroveted people are using more posetive words than introverts .
+it can easily be seen that sensing people using posetive words more than intuitive people . 
+we have this for feeling people form thinking people too. 
+
+**sentiment analysis by NRC dataset**
+```{r}
+tokens  %>% group_by(type)%>%
+  inner_join(get_sentiments("nrc")) %>% # pull out only sentiment words
+  count(sentiment) %>% # count the # of positive & negative words
+  spread(sentiment, n, fill = 0) -> nrc_tokens # made data wide rather than narrow 
+```
+*Mood Ring for all types*
+```{r}
+library(chorddiag)
+row_names <- nrc_tokens$type
+sent_count <- dim(nrc_tokens)[2]
+nrc_tokens <- cbind(nrc_tokens, Total = rowSums(nrc_tokens[,2:sent_count]))
+nrc_tokens[,2:sent_count] <- nrc_tokens[,2:sent_count] / nrc_tokens$Total
+head(nrc_tokens)
+
+stu = as.matrix(nrc_tokens[,2:sent_count])
+row.names(stu) = row_names
+chorddiag(stu, type = "bipartite", showTicks = F, groupnameFontsize = 14, groupnamePadding = 10, margin = 90)
+
+```
+
+as you can see there are some intution about group that we cant get by this chart . 
+but for further analysis we have to find this chart for each diffrent type . like Extrovert to introvert and...
+
+for each two column for below lines are showing 
+ESTJ: extraversion (E), sensing (S), thinking (T), judgment (J)
+INFP: introversion (I), intuition (N), feeling (F), perception (P)
+
+```{r}
+nrc_tokens %>% mutate(introvert = ifelse(str_detect(type,'I'),'INTROVERT','EXTROVERTS'))%>% mutate(thinking = ifelse(str_detect(type,'T'),"Thinking",'Feeling')) %>% 
+   mutate(Sensing = ifelse(str_detect(type,'S'),"Sensing",'intuition')) %>% 
+   mutate(Judgment = ifelse(str_detect(type,'J'),"Judgment",'perception')) -> nrc_tokens
+  
+```
+
+*EXTROVERTS,INTROVERT*
+
+```{r}
+nrc_tokens %>% ungroup() -> nrc_tokens
+temp =split(nrc_tokens,f=nrc_tokens$introvert)
+r1 <- temp$EXTROVERTS %>%  select(c(2:sent_count)) %>% colSums()
+r2 <- temp$INTROVERT %>%  select(c(2:sent_count)) %>% colSums()
+stu <- rbind(INTROVERT=r1,EXTROVERTS=r2)
+row.names(stu)
+chorddiag(stu, type = "bipartite", showTicks = F, groupnameFontsize = 14, groupnamePadding = 10, margin = 90)
+```
+as it can be seen introverts and extroverts are using same percent of diffrent sentimental words in their posts. 
+
+*Thinking,Feeling*
+```{r}
+temp =split(nrc_tokens,f=nrc_tokens$thinking)
+r1 <- temp$Thinking %>%  select(c(2:sent_count)) %>% colSums()
+r2 <- temp$Feeling %>%  select(c(2:sent_count)) %>% colSums()
+stu <- rbind(Thinking=r1,Feeling=r2)
+row.names(stu)
+chorddiag(stu, type = "bipartite", showTicks = F, groupnameFontsize = 14, groupnamePadding = 10, margin = 90)
+```
+it can be seen that thinking people are using more negetive words more than feeling people . 
+for joy category of words it is use more by feeling people . 
+
+*Sensing,intuition*
+```{r}
+temp =split(nrc_tokens,f=nrc_tokens$Sensing)
+r1 <- temp$Sensing %>%  select(c(2:sent_count)) %>% colSums()
+r2 <- temp$intuition %>%  select(c(2:sent_count)) %>% colSums()
+stu <- rbind(Sensing=r1,intuition=r2)
+row.names(stu)
+chorddiag(stu, type = "bipartite", showTicks = F, groupnameFontsize = 14, groupnamePadding = 10, margin = 90)
+```
+
+*Judgment,perception*
+```{r}
+temp =split(nrc_tokens,f=nrc_tokens$Judgment)
+r1 <- temp$Judgment %>%  select(c(2:sent_count)) %>% colSums()
+r2 <- temp$perception %>%  select(c(2:sent_count)) %>% colSums()
+stu <- rbind(Judgment=r1,perception=r2)
+row.names(stu)
+chorddiag(stu, type = "bipartite", showTicks = F, groupnameFontsize = 14, groupnamePadding = 10, margin = 90)
+```
+
+**Overal Shape of each types Post**
+**POST LENGTH OF EACH CATEGORY**
+
+```{r}
+all_type_sen %>% mutate(text_size = str_length(text)) %>% group_by(type) %>% summarise(mean_post_size= mean(text_size,na.rm=T)) %>%  arrange(mean_post_size) %>% ggplot() + geom_bar(aes(x=reorder(type,-mean_post_size),y=mean_post_size,fill=type),stat='identity')+ theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+as it can be seeb intuition people tend to have longer post size than Sensing people. this can be shown easily by seprating 
+intuition and Sensing like below :
+```{r}
+all_type_sen %>% 
+mutate(introvert = ifelse(str_detect(type,'I'),'INTROVERT','EXTROVERTS'))%>% mutate(thinking = ifelse(str_detect(type,'T'),"Thinking",'Feeling')) %>% 
+   mutate(Sensing = ifelse(str_detect(type,'S'),"Sensing",'intuition')) %>% 
+   mutate(Judgment = ifelse(str_detect(type,'J'),"Judgment",'perception')) ->all_type_sen
+all_type_sen %>% mutate(text_size = str_length(text)) %>% group_by(Sensing) %>% summarise(mean_post_size= mean(text_size,na.rm=T)) %>%  arrange(mean_post_size) %>% ggplot() + geom_bar(aes(x=reorder(Sensing,-mean_post_size),y=mean_post_size,fill=Sensing),stat='identity')+ theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+```
+
+```{r,eval=FALSE, eval=FALSE, warning=TRUE}
+clean_type_sen <- NULL
+#' Count frequency of a word or punctuation mark in a text
+#'
+#' Matches a vector of target words/punctuation marks to a larger vector 
+#' of words/punctuation marks and counts how many times that particular word or 
+#' punctuation marks occurs in the larger string. Returns a data table with the 
+#' matched words or punctuation marks with their number the occurrances 
+#' in the larger string.
+#'
+#' @param characters Large vector of words/punctuation marks to be matched with 
+#'        a smaller list of desired words/characters.
+#' @param char.list Vector of target words/punctuation marks to be matched with the larger
+#'        vector of words/characters
+#' @param punctuation Boolean that determines whether to convert
+#'        punctuation marks into words in final output table
+#' @note the accepted punctuation marks are commas, periods, semicolons, question marks
+#'        exclamation points, quotation marks (forward and backward), ellipses and em-dashes.
+#' @note to match quotation marks, use Unicode characters for right (u201D) and left (u201C) 
+#'       quotation marks.
+#' @export
+#' @examples
+#' char <- extract_token(gardenParty)
+#' charfreq(char, c("she", "he", "them"), punctuation = FALSE)
+#' 
+#' char <- extract_punct(gardenParty)
+#' charfreq(char, c(".", "...", "?"), punctuation = TRUE)
+
+#' Get frequency of words per line
+#'
+#' Returns a data table returning the number of times a series of desired
+#' words appears in a given line of text and the index number of that line.
+#'
+#' @param text Any text or document as a character vector
+#' @param freqwords Vector of target words 
+#'        to be matched with the text/document of interest
+#' @importFrom dplyr mutate
+#' @importFrom tidyr spread
+#' @export
+#' @examples
+#' freq_word_line(text = gardenParty, freqwords = c("she", "they", "he"))
+
+freq_word_line <- function(text, freqwords){
+  line_index <- c()
+  frequency <- NA
+  for(i in 1:length(text)){
+    words <- extract_token(text[i])
+    WordsFreq <- charfreq(words, freqwords)
+    line_index <- c(line_index, paste(i))
+    WordsFreq <- tidyr::spread(WordsFreq, character, freq)
+    if(i == 1){
+      frequency <- WordsFreq
+    }
+    else{
+      frequency <- rbind(frequency, WordsFreq)
+    }
+  }
+  line_index <- as.numeric(line_index)
+  output <- cbind(line_index, frequency)
+  return(output)
+}
+
+#' Get frequency of punctuation marks per line
+#'
+#' Returns a data table returning the number of times a series of 
+#' desired punctuation marks appear in a given line and the index 
+#' number of that line.
+#'
+#' @param text Vector of strings representing lines of a text
+#' @param punctlist Vector of target punctuation marks to be matched 
+#'        with the text/document of interest
+#' @importFrom dplyr mutate
+#' @importFrom tidyr spread
+#' @export
+#' @examples
+#' freq_punct_line(text = gardenParty, punctlist = c(".", "?", "..."))
+
+freq_punct_line <- function(text, punctlist){
+  line_index <- c()
+  frequency <- NA
+  for(i in 1:length(text)){
+    words <- extract_punct(text[i])
+    WordsFreq <- charfreq(words, punctlist, punctuation = TRUE)
+    line_index <- c(line_index, paste(i))
+    WordsFreq <- tidyr::spread(WordsFreq, character, freq)
+    if(i == 1){
+      frequency <- WordsFreq
+    }
+    else{
+      frequency <- rbind(frequency, WordsFreq)
+    }
+  }
+  line_index <- as.numeric(line_index)
+  output <- cbind(line_index, frequency)
+  return(output)
+}
+```
+
+***frequency of punctuation for each type*
+I use punctuation frequency as I think maybe sensing people using more punctuation than other group . 
+```{r}
+
+charfreq <- function(characters, char.list, punctuation = FALSE){
+  freq <- c()
+  char.list[which(char.list=="?")] <- "\\?"
+  char.list[which(char.list==".")] <- "~"
+  if(punctuation == FALSE){
+    char.list <- paste("^", char.list, sep = "")
+  }
+  else{
+    characters[which(characters == ".")] <- "~"
+  }
+  for(i in 1:length(char.list)){
+    x <- length(grep(char.list[i], characters))
+    freq <- c(freq, x)
+    if(punctuation == TRUE){
+      if (char.list[i] == ","){
+        char.list[i] <- "comma"
+      }
+      if (char.list[i] == "\u2014"){
+        char.list[i] <- "em_dash"
+      }
+      if (char.list[i] == "~"){
+        char.list[i] <- "period"
+      }
+      if (char.list[i] == "\\?"){
+        char.list[i] <- "question_mark"
+      }
+      if (char.list[i] == "!"){
+        char.list[i] <- "exclaim_point"
+      }
+      if (char.list[i] == "..."){
+        char.list[i] <- "ellipsis"
+      }
+      if (char.list[i] == ";"){
+        char.list[i] <- "semicolon"
+      }
+      if (char.list[i] == "\u201C"){
+        char.list[i] <- "left_quote"
+      } 
+      if (char.list[i] == "\u201D"){
+        char.list[i] <- "right_quote"
+      }
+    }
+  }
+  char.list[which(char.list=="~")] <- "\\."
+  if(punctuation == FALSE){
+    char.list = substring(char.list, 2)
+  }
+  output <- data.frame(char.list, freq)
+  colnames(output) <- c("character", "freq")
+  return(output)
+}
+
+
+
+
+all_type_sen <- melt(type_sen,id= 'type')
+all_type_sen$variable = NULL
+colnames(all_type_sen)[2] = 'text'
+head(all_type_sen,100)
+temp <- sample_n(all_type_sen, 10000)
+panc <- data.frame(question_mark=numeric(),exclaim_point=numeric())
+for (i in 1:length(temp$type)){
+  panc = rbind(panc,spread(
+    charfreq(temp$text[i],c("?",'!'), punctuation = TRUE),character,freq))
+}
+panc$type <- temp$type
+panc %>% group_by(type) %>% summarise(mean_question_count = mean(question_mark),mean_exclaim_point_count=mean(exclaim_point)) -> panc_temp
+panc_temp%>% ggplot() + geom_bar(aes(x=reorder(type,-mean_question_count),y=mean_question_count,fill=type),stat='identity')+ theme(axis.text.x = element_text(angle = 90, hjust = 1))
+ 
+```
+as you can see count of using question mark (?) is diffrent between each group. like it seems that Thinking people are using more question mark (?) than Feeling type people . 
+that maybe beacause they ask more.
+but we can see more variation between personolity type for (exclaim_point) (!) .
+```{r}
+panc_temp%>% ggplot() + geom_bar(aes(x=reorder(type,-mean_exclaim_point_count),y=mean_exclaim_point_count,fill=type),stat='identity')+ theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+```
+*as it can be easily seen all F (feeling type) are using more ! punctuation than Thinking people* that it could be meaningfull for findyng personolity type.
